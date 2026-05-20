@@ -191,6 +191,157 @@ __global__ void single_layer_kv_transfer_kernel(
   }
 }
 
+template <typename scalar_t, bool USE_MLA>
+__global__ void single_layer_head_token_wise_kv_transfer_kernel(
+    // scalar_t* __restrict__ lmc_key_cache,    // [num_tokens,
+    // num_heads*head_size] scalar_t* __restrict__ lmc_value_cache,  //
+    // [num_tokens, num_heads*head_size]
+    scalar_t* __restrict__ lmc_key_value_cache,   // [num_tokens, 2,
+                                                  // num_heads*head_size]
+                                                  // or
+                                                  // [2, num_tokens,
+                                                  // num_heads*head_size]
+                                                  // or for MLA:
+                                                  // [num_tokens,
+                                                  // aligned_head_size]
+    scalar_t* __restrict__ vllm_key_value_cache,  // [2, num_blocks, block_size,
+                                                  // num_heads, head_size] or
+                                                  // [num_blocks, 2, block_size,
+                                                  // num_heads, head_size]
+                                                  // or for MLA:
+                                                  // [num_blocks, block_size,
+                                                  // head_size]
+
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t* __restrict__ selected_tokens,
+    const int vllm_block_key_stride_in_64bit, const int vllm_value_offset,
+    const int lmc_stride, const int lmc_value_offset, const int num_heads,
+    const int head_size_in_64bit, const int block_size,
+    const TransferDirection direction,
+    const int fixed_head) {
+
+    int64_t token_idx;
+    int64_t head_idx;
+
+  if (fixed_head >= 0) {
+    // grid size num_tokens
+    token_idx = blockIdx.x;
+    head_idx = fixed_head;
+  } else {
+    // grid size num_tokens * num_heads
+    int64_t token_head_idx = blockIdx.x;
+    token_idx = token_head_idx / num_heads;
+    head_idx = token_head_idx % num_heads;
+  }
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // 从 selected_tokens 获取 LMCache 中的真实 token 索引
+  const int64_t lmc_token_idx = selected_tokens[token_idx];
+
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  // const int n = num_heads * head_size_in_64bit;
+
+  const int64_t k_offset_in_token = head_idx * head_size_in_64bit;
+
+  for (int i = threadIdx.x; i < head_size_in_64bit; i += blockDim.x) {
+    const int64_t lmc_key_idx = lmc_token_idx * lmc_stride + k_offset_in_token + i;
+
+    const int64_t vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
+                                 block_offset * num_heads * head_size_in_64bit +
+                                 head_idx * head_size_in_64bit + i;
+
+    if (direction == TransferDirection::D2H) {
+      // GPU to LMCache
+      lmc_key_value_cache[lmc_key_idx] = vllm_key_value_cache[vllm_key_idx];
+      // For non-MLA, also copy the value component
+      if constexpr (!USE_MLA) {
+        const int64_t lmc_value_idx = lmc_key_idx + lmc_value_offset;
+        const int64_t vllm_value_idx = vllm_key_idx + vllm_value_offset;
+        lmc_key_value_cache[lmc_value_idx] =
+            vllm_key_value_cache[vllm_value_idx];
+      }
+    } else {
+      // LMCache to GPU
+      vllm_key_value_cache[vllm_key_idx] = lmc_key_value_cache[lmc_key_idx];
+      // For non-MLA, also copy the value component
+      if constexpr (!USE_MLA) {
+        const int64_t lmc_value_idx = lmc_key_idx + lmc_value_offset;
+        const int64_t vllm_value_idx = vllm_key_idx + vllm_value_offset;
+        vllm_key_value_cache[vllm_value_idx] =
+            lmc_key_value_cache[lmc_value_idx];
+      }
+    }
+  }
+}
+
+
+template <typename T>
+__global__ void single_layer_sparse_kv_transfer_kernel(
+    int64_t* __restrict__ lmcache_kv_device_ptrs,   // [num_chunks]
+    T* __restrict__ vllm_k,                         // vLLM K cache: [num_blocks, block_size, num_heads, head_dim]
+    T* __restrict__ vllm_v,                         // vLLM V cache
+    const int64_t* __restrict__ slot_mapping,       // [num_all_tokens]
+    const int64_t* __restrict__ selected_tokens,    // [num_heads, num_selected_tokens]
+    const int64_t token_start_index,
+    const int num_selected_tokens,
+    const int num_heads,
+    const int num_tokens_per_chunk,
+    const int block_size,
+    const int head_dim,
+    const int stride_vllm_block,                    // = block_size * num_heads * head_dim
+    const int stride_vllm_slot,                     // = num_heads * head_dim
+    const int stride_vllm_head,                     // = head_dim
+    const int stride_lm_token,                      // = 2 * num_heads * head_dim
+    const int stride_lm_kv,                         // = num_heads * head_dim
+    const int stride_lm_dim,                       // = head_dim
+    const int stride_sel_head                       // = num_selected_tokens
+) {
+    const int head_idx = blockIdx.x;
+    const int token_j   = blockIdx.y;
+
+    if (head_idx >= num_heads || token_j >= num_selected_tokens)
+        return;
+
+    // 1.token index for this thread block
+    const int64_t global_token_idx = selected_tokens[head_idx * stride_sel_head + token_j];
+
+    // 2. lmcache chunk indexing
+    const int chunk_idx = global_token_idx / num_tokens_per_chunk;
+    const int token_offset = global_token_idx % num_tokens_per_chunk;
+
+    // 3. src cpu base ptr（CPU pinned memory）
+    T* chunk_ptr = reinterpret_cast<T*>(lmcache_kv_device_ptrs[chunk_idx]);
+
+    // 4. vllm slot indexing
+    const int64_t slot = slot_mapping[token_start_index + token_j];
+    const int block_idx = slot / block_size;
+    const int block_offset = slot % block_size;
+
+    // 5. src
+    T* src_k = chunk_ptr + token_offset * stride_lm_token
+            + 0 * stride_lm_kv + head_idx * stride_lm_dim;
+    T* src_v = chunk_ptr + token_offset * stride_lm_token
+            + 1 * stride_lm_kv + head_idx * stride_lm_dim;
+
+    // 6. dst
+    T* dst_k = vllm_k + block_idx * stride_vllm_block
+             + block_offset * stride_vllm_slot + head_idx * stride_vllm_head;
+    T* dst_v = vllm_v + block_idx * stride_vllm_block
+             + block_offset * stride_vllm_slot + head_idx * stride_vllm_head;
+
+    // 7. copy
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        dst_k[d] = src_k[d];
+        dst_v[d] = src_v[d];
+    }
+}
+
+
 template <GPUKVFormat format>
 __device__ __forceinline__ int64_t
 page_buffer_offset(const int k_or_v, const int token_idx,
@@ -752,6 +903,218 @@ void single_layer_kv_transfer(
             lmc_value_offset, num_heads, head_size_in_64bit, block_size,
             direction);
   }
+}
+
+void single_layer_head_token_wise_kv_transfer(
+    torch::Tensor& lmc_key_value_cache,  // [num_tokens, 2, num_heads*head_size]
+                                         // or
+                                         // [2, num_tokens, num_heads*head_size]
+                                         // or for MLA:
+                                         // [num_tokens, aligned_head_size]
+    torch::Tensor&
+        vllm_key_value_cache,  // [2, num_blocks, block_size, num_heads,
+                               // head_size] for flash attention
+                               // [num_blocks, 2, block_size, num_heads, head_size] for flash infer
+                               // [num_blocks, block_size, head_size] for MLA
+
+    torch::Tensor& slot_mapping,  // [num_selected_tokens]
+    const torch::Tensor& selected_tokens_per_chunk,  // [num_selected_tokens], selected token indices in lmc_key_value_cache
+    const TransferDirection direction, const GPUKVFormat gpu_kv_format,
+    const bool token_major, // true: lmc_key_value_cache is
+                            // [num_tokens, 2, num_heads*head_size]
+                            // false: lmc_key_value_cache is
+                            // [2, num_tokens, num_heads*head_size]
+    const int target_head // selected kv head to transfer
+) {
+  int64_t* lmc_key_value_cache_ptr =
+      get_kernel_ptr<int64_t, torch::Tensor>(lmc_key_value_cache);
+
+  int64_t* vllm_key_value_cache_ptr =
+      get_kernel_ptr<int64_t, torch::Tensor>(vllm_key_value_cache);
+
+  const int64_t* slot_mapping_ptr =
+      get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
+
+  const int64_t* selected_tokens_ptr = get_kernel_ptr<const int64_t, const torch::Tensor>(selected_tokens_per_chunk);
+
+  int elements_per_entry = 8 / vllm_key_value_cache.element_size();
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads;
+  int head_size_in_64bit;
+  int block_size;
+
+  const bool use_mla = lmc::is_mla(gpu_kv_format);
+
+  if (use_mla) {
+    // MLA format: [num_blocks, block_size, head_size]
+    num_heads = 1;
+    block_size = vllm_key_value_cache.size(1);
+    head_size_in_64bit = vllm_key_value_cache.size(2) / elements_per_entry;
+  } else {
+    num_heads = vllm_key_value_cache.size(3);
+    head_size_in_64bit = vllm_key_value_cache.size(4) / elements_per_entry;
+    block_size = vllm_key_value_cache.size(2);
+  }
+
+  int lmc_stride;
+  int lmc_value_offset;
+  if (use_mla) {
+    // MLA format: [num_tokens, aligned_head_size]
+    lmc_stride = lmc_key_value_cache.stride(0) / elements_per_entry;
+    lmc_value_offset = 0;  // No separate K/V for MLA
+  } else if (token_major) {
+    lmc_stride = lmc_key_value_cache.stride(0) / elements_per_entry;
+    lmc_value_offset = lmc_key_value_cache.stride(1) / elements_per_entry;
+  } else {
+    lmc_stride = lmc_key_value_cache.stride(1) / elements_per_entry;
+    lmc_value_offset = lmc_key_value_cache.stride(0) / elements_per_entry;
+  }
+
+  int vllm_block_key_stride_in_64bit;
+  int vllm_value_offset;
+  if (use_mla) {
+    // MLA format: [num_blocks, block_size, head_size]
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = 0;  // No separate K/V for MLA
+  } else if (gpu_kv_format == GPUKVFormat::NL_X_TWO_NB_BS_NH_HS) {
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(1) / elements_per_entry;
+    vllm_value_offset = vllm_key_value_cache.stride(0) / elements_per_entry;
+  } else {  // gpu_kv_format == GPUKVFormat::NL_X_NB_TWO_BS_NH_HS
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = vllm_key_value_cache.stride(1) / elements_per_entry;
+  }
+
+  int grid_size;
+  if (target_head >= 0 && target_head < num_heads) {
+    grid_size = num_tokens;
+  } else {
+    grid_size = num_tokens * num_heads; // one block per (token, head)
+  }
+  dim3 grid(grid_size);
+
+  int threads_per_block = std::min(head_size_in_64bit, 256);
+  dim3 block(threads_per_block);
+  const at::cuda::OptionalCUDAGuard device_guard(
+      device_of(vllm_key_value_cache));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Dispatch to the appropriate template specialization based on use_mla
+  if (use_mla) {
+    lmc::single_layer_head_token_wise_kv_transfer_kernel<int64_t, true>
+        <<<grid, block, 0, stream>>>(
+            lmc_key_value_cache_ptr, vllm_key_value_cache_ptr, slot_mapping_ptr, selected_tokens_ptr,
+            vllm_block_key_stride_in_64bit, vllm_value_offset, lmc_stride,
+            lmc_value_offset, num_heads, head_size_in_64bit, block_size,
+            direction, target_head);
+  } else {
+    lmc::single_layer_head_token_wise_kv_transfer_kernel<int64_t, false>
+        <<<grid, block, 0, stream>>>(
+            lmc_key_value_cache_ptr, vllm_key_value_cache_ptr, slot_mapping_ptr, selected_tokens_ptr,
+            vllm_block_key_stride_in_64bit, vllm_value_offset, lmc_stride,
+            lmc_value_offset, num_heads, head_size_in_64bit, block_size,
+            direction, target_head);
+  }
+}
+
+void single_layer_sparse_kv_transfer(
+    std::vector<torch::Tensor>& lmcache_tensors,           // [num_chunks] int64
+    torch::Tensor& vllm_kv_cache,          // [2, num_blocks, block_size, num_heads, head_dim]
+    torch::Tensor& slot_mapping,            // [num_all_tokens] int64
+    torch::Tensor& selected_tokens_per_head,// [num_heads, num_selected_tokens] int64
+    int64_t token_start_index,
+    int64_t num_tokens_per_chunk
+) {
+    TORCH_CHECK(vllm_kv_cache.is_cuda(), "vllm_kv_cache must be on GPU");
+    TORCH_CHECK(slot_mapping.is_cuda(), "slot_mapping must be on GPU");
+    TORCH_CHECK(selected_tokens_per_head.is_cuda(), "selected_tokens_per_head must be on GPU");
+
+    const int64_t* slot_mapping_ptr =
+        get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
+    const int64_t* selected_tokens_ptr =
+        get_kernel_ptr<const int64_t, const torch::Tensor>(selected_tokens_per_head);
+
+    // Get device pointer from host pointer
+    int64_t num_chunks = lmcache_tensors.size();
+    auto dev_ptrs_tensor = torch::empty(
+        {num_chunks},
+        torch::TensorOptions().dtype(torch::kInt64).device(vllm_kv_cache.device())
+    );
+    int64_t* dev_ptrs_array = dev_ptrs_tensor.data_ptr<int64_t>();
+    std::vector<int64_t> host_dev_ptrs(num_chunks);
+    for (int64_t i = 0; i < num_chunks; ++i) {
+        void* d_ptr = nullptr;
+        cudaError_t err = cudaHostGetDevicePointer(
+            &d_ptr,
+            reinterpret_cast<void*>(lmcache_tensors[i].data_ptr()),
+            0
+        );
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaHostGetDevicePointer failed for chunk ", i,
+                    ": ", cudaGetErrorString(err));
+        host_dev_ptrs[i] = reinterpret_cast<int64_t>(d_ptr); // device pointer
+    }
+    cudaMemcpy(dev_ptrs_array,
+              host_dev_ptrs.data(),
+              num_chunks * sizeof(int64_t),
+              cudaMemcpyHostToDevice);
+
+    const auto num_heads = selected_tokens_per_head.size(0);
+    const auto num_selected_tokens = selected_tokens_per_head.size(1);
+    const auto num_blocks = vllm_kv_cache.size(1);
+    const auto block_size = vllm_kv_cache.size(2);
+    const auto head_dim = vllm_kv_cache.size(4);
+    auto vllm_k = vllm_kv_cache[0].contiguous();
+    auto vllm_v = vllm_kv_cache[1].contiguous();
+
+    // stride
+    const int stride_vllm_block = vllm_k.stride(0);   // block_size * num_heads * head_dim
+    const int stride_vllm_slot  = vllm_k.stride(1);   // num_heads * head_dim
+    const int stride_vllm_head  = vllm_k.stride(2);   // head_dim
+
+    const int stride_lm_token = 2 * num_heads * head_dim;
+    const int stride_lm_kv    = num_heads * head_dim;
+    const int stride_lm_dim  = head_dim;
+
+    const int stride_sel_head = selected_tokens_per_head.stride(0);
+
+    // grid / block
+    dim3 grid(num_heads, num_selected_tokens);
+    int block_threads = std::min(head_dim, static_cast<int64_t>(1024));
+    dim3 block(block_threads);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      vllm_kv_cache.scalar_type(),
+      "single_layer_sparse_kv_transfer_kernel",
+      [&] {
+        lmc::single_layer_sparse_kv_transfer_kernel<scalar_t><<<grid, block>>>(
+            dev_ptrs_tensor.data_ptr<int64_t>(),
+            vllm_k.data_ptr<scalar_t>(),
+            vllm_v.data_ptr<scalar_t>(),
+            slot_mapping_ptr,
+            selected_tokens_ptr,
+            token_start_index,
+            static_cast<int>(num_selected_tokens),
+            static_cast<int>(num_heads),
+            static_cast<int>(num_tokens_per_chunk),
+            static_cast<int>(block_size),
+            static_cast<int>(head_dim),
+            stride_vllm_block,
+            stride_vllm_slot,
+            stride_vllm_head,
+            stride_lm_token,
+            stride_lm_kv,
+            stride_lm_dim,
+            stride_sel_head
+        );
+      }
+    );
+    // cudaDeviceSynchronize();
 }
 
 void load_and_reshape_flash(

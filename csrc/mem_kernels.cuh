@@ -95,6 +95,15 @@ void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
                               const GPUKVFormat gpu_kv_format,
                               const bool token_major = false);
 
+void single_layer_head_token_wise_kv_transfer(torch::Tensor& lmc_key_value_cache,
+                              torch::Tensor& vllm_key_value_cache,
+                              torch::Tensor& slot_mapping,
+                              const torch::Tensor& selected_tokens_per_chunk,
+                              const TransferDirection direction,
+                              const GPUKVFormat gpu_kv_format,
+                              const bool token_major = false,
+                              const int target_head = -1);
+
 void single_layer_kv_transfer_sgl(torch::Tensor& lmc_key_value_cache,
                                   torch::Tensor& sgl_key_cache,
                                   torch::Tensor& sgl_value_cache,
@@ -118,3 +127,10 @@ void reshape_and_cache_back_flash(torch::Tensor& key_value,
                                   torch::Tensor& value_cache,
                                   torch::Tensor& slot_mapping,
                                   const int layer_idx);
+
+void single_layer_sparse_kv_transfer(std::vector<torch::Tensor>& lmcache_tensors, // list[num_chunks] int64
+                                     torch::Tensor& vllm_kv_cache,                // [2, num_blocks, block_size, num_heads, head_dim]
+                                     torch::Tensor& slot_mapping,                 // [num_all_tokens] int64
+                                     torch::Tensor& selected_tokens_per_head,     // [num_heads, num_selected_tokens] int64
+                                     int64_t token_start_index,
+                                     int64_t num_tokens_per_chunk);

@@ -186,6 +186,8 @@ class LMCacheEngine:
         self.retrieve_locations = config.retrieve_locations
 
         self.num_layers = metadata.kv_shape[0]
+        self.num_heads = metadata.kv_shape[3]
+        self.head_size = metadata.kv_shape[4]
         self.fmt = None
         if self.use_layerwise:
             if metadata.use_mla:
@@ -1045,6 +1047,179 @@ class LMCacheEngine:
             )
 
         yield ret_mask
+
+
+    def retrieve_layer_head_token_wise(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """
+        Retrieve the KV cache in a layerwise manner.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask will be all True for
+            sparse attention with chunk size 1
+
+        :param **kwargs: The additional arguments for the storage backend which
+            will be passed into the gpu_connector.
+
+        return: A generator that yields Optional[torch.Tensor]. The tensor will
+            be the boolean mask indicating which tokens are retrieved and will
+            only be returned in the last iteration. In the first iteration,
+            the generator retrieve the memory objects of the first layer from
+            the storage backends. In the next iterations, it moves the KV cache
+            of layer i from the memory objects (on CPU) to GPU and retrieves
+            the memory objects of layer i+1 from the storage backends. In the
+            last iteration, it moves the memory objects of the last layer to
+            the GPU.
+        """
+
+        # Health check: block operation if LMCache is unhealthy
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
+            yield torch.zeros(len(tokens), dtype=torch.bool)
+            return
+
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
+
+        mem_obj_consumer = None
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+        starts = []
+        ends = []
+        keys = []
+
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        location = None
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            keys_multi_layer = key.split_layers(self.num_layers)
+            found = self.storage_manager.contains(
+                keys_multi_layer[0], self.retrieve_locations
+            )
+            logger.info(f"[debug-load] chunk start={start} end={end} found={bool(found)}")
+            if found:
+                location = location or found
+                starts.append(start); ends.append(end); keys.append(keys_multi_layer)
+                ret_mask[start:end] = True
+            else:
+                logger.info(f"[debug-load] STOP: chunk start={start} end={end} not found")
+                break
+
+            keys_multi_layer = key.split_layers(self.num_layers)
+
+            # NOTE: Only check the first layer
+            if current_location := self.storage_manager.contains(
+                keys_multi_layer[0], self.retrieve_locations
+            ):
+                if location is None:
+                    location = current_location
+                else:
+                    # TODO(Jiayi): Support multi-location retrieval in the future
+                    assert location == current_location, (
+                        "All retrieved keys should be from the same location "
+                        "when use layerwise retrieval."
+                        "Please support multi-location retrieval in the future."
+                    )
+            else:
+                break
+
+            starts.append(start)
+            ends.append(end)
+            keys.append(keys_multi_layer)
+
+            ret_mask[start:end] = True
+
+        if not keys:
+            # If no cache are found, we still need to yield to avoid `StopIteration`
+            for layer_id in range(self.num_layers):
+                yield None
+            # synchronize the last layer
+            if not mem_obj_consumer:
+                mem_obj_consumer = (x for x in [])  
+            next(mem_obj_consumer)
+            yield ret_mask
+            return
+
+        assert_layerwise_gpu_connector(self.gpu_connector)
+
+        # keys: list[chunk_num, layer_num]
+        # generator of each layer's get
+        keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+        get_generator = self.storage_manager.layerwise_batched_get(
+            keys_layer_major,
+            location=location,
+        )
+
+        load_all = False
+        to_count_down = []
+        for layer_id in range(self.num_layers):
+            task = next(get_generator)
+            assert task is not None
+
+            # tokens.size = [kv_head_num, tokens_per_head]
+            try:
+                tokens, token_start_index = yield ret_mask
+                if tokens is None:
+                    # load all head and all tokens
+                    load_all = True
+                elif tokens.dim() == 1:
+                    tokens = tokens.unsqueeze(0).repeat(self.num_heads, 1)
+            except GeneratorExit:
+                raise
+
+            mem_objs_layer = task.result() # list[MemoryObj]
+
+            # NL_X_TWO_NB_BS_NH_HS
+            # layers[(2, num_blocks, block_size, num_heads, head_size)]
+            # NL_X_NB_TWO_BS_NH_HS
+            # layers[(num_blocks, 2, block_size, num_heads, head_size)]
+            if load_all:
+                if not mem_obj_consumer:
+                    mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+                    next(mem_obj_consumer)
+
+                mem_obj_consumer.send(mem_objs_layer)
+            else:
+                if not mem_obj_consumer:
+                    # starts~ends are the positions of the tokens in slot_mapping
+                    mem_obj_consumer = self.gpu_connector.batched_to_gpu_head_token_wise(**kwargs)
+                    next(mem_obj_consumer)   # yield for send(mem_objs_layer_multiheads)
+
+                mem_tensors_layer = [memory_obj.raw_tensor for memory_obj in mem_objs_layer]
+                # TODO: pass the actual start index
+                token_start_index = 0
+                print(f"[debug2] layer_id={layer_id}, mem_obj[0]={mem_objs_layer[0]}, "
+                    f"raw_tensor.shape={mem_objs_layer[0].raw_tensor.shape}, "
+                    f"has_metadata={hasattr(mem_objs_layer[0], 'metadata')}")
+                if hasattr(mem_objs_layer[0], 'metadata'):
+                    print(f"[debug2] metadata={mem_objs_layer[0].metadata}")
+                mem_obj_consumer.send((mem_tensors_layer, tokens, token_start_index))
+            to_count_down.extend(mem_objs_layer)
+        for mem_obj in to_count_down:
+            mem_obj.ref_count_down()
+
+        # synchronize the last layer
+        if not mem_obj_consumer:
+            mem_obj_consumer = (x for x in [])  
+        next(mem_obj_consumer)
+
+        yield ret_mask
+
 
     @_lmcache_nvtx_annotate
     def lookup(

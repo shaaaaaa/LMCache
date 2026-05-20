@@ -37,6 +37,14 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("lmc_key_value_cache"), py::arg("vllm_key_value_cache"),
         py::arg("slot_mapping"), py::arg("direction"), py::arg("gpu_kv_format"),
         py::arg("token_major") = false);
+  m.def("single_layer_head_token_wise_kv_transfer", &single_layer_head_token_wise_kv_transfer,
+        py::arg("lmc_key_value_cache"), py::arg("vllm_key_value_cache"),
+        py::arg("slot_mapping"), py::arg("selected_tokens_per_chunk"), py::arg("direction"), py::arg("gpu_kv_format"),
+        py::arg("token_major") = false, py::arg("target_head") = -1);
+  m.def("single_layer_sparse_kv_transfer", &single_layer_sparse_kv_transfer,
+        py::arg("lmcache_tensors"), py::arg("vllm_kv_cache"),
+        py::arg("slot_mapping"), py::arg("selected_tokens_per_head"), py::arg("token_start_index"),
+        py::arg("num_tokens_per_chunk"));
   m.def("single_layer_kv_transfer_sgl", &single_layer_kv_transfer_sgl,
         py::arg("lmc_key_value_cache"), py::arg("sgl_key_cache"),
         py::arg("sgl_value_cache"), py::arg("slot_mapping"),
