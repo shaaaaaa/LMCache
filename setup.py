@@ -96,7 +96,7 @@ def cuda_extension() -> tuple[list, dict]:
             "lmcache.c_ops",
             sources=cuda_sources,
             extra_compile_args={
-                "cxx": [flag_cxx_abi, "-std=c++17"],
+                "cxx": [flag_cxx_abi, "-std=c++17", "-O3"],
                 "nvcc": [flag_cxx_abi],
             },
         ),

@@ -4,6 +4,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
+from collections import defaultdict
 
 # Third Party
 from vllm.config import (
@@ -138,6 +140,12 @@ class RequestTracker:
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
 
+    # key of cached object
+    cached_keys: list[list[str]] = field(default_factory=list)
+
+    # device ptr of cached object
+    cached_mem_obj_ptr: list[list[int]] = field(default_factory=list)
+
     @_lmcache_nvtx_annotate
     @staticmethod
     def from_new_request(
@@ -264,7 +272,7 @@ class RequestTracker:
         # When a request is scheduled again, and the number of new tokens
         # is 1 (excluding chunked prefill), the request is in decode phase.
         # TODO: Need to further exclude the case of chunked prefill with 1 token.
-        if len(new_token_ids) == 1:
+        if len(new_token_ids) <= 1:
             self.is_decode_phase = True
 
 
@@ -277,8 +285,17 @@ class ReqMeta:
     # Slot mapping
     slot_mapping: torch.Tensor
 
+    # key of cached object
+    cached_keys: list[list[str]] = field(default_factory=list)
+
+    # device ptr of cached object
+    cached_mem_obj_ptr: list[list[int]] = field(default_factory=list)
+
     # Whether is last prefill or not
     is_last_prefill: bool = False
+
+    # Whether is sparse attention and decode or not
+    is_sparse_decode: bool = False
 
     # Skip save or not
     save_spec: Optional[SaveSpec] = None
@@ -297,6 +314,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        is_sparse_decode: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -335,7 +353,7 @@ class ReqMeta:
 
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary and discard_partial_chunks)
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
         )
@@ -417,10 +435,13 @@ class ReqMeta:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             is_last_prefill=is_last_prefill,
+            is_sparse_decode=is_sparse_decode,
             save_spec=save_spec,
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            cached_keys=tracker.cached_keys,
+            cached_mem_obj_ptr=tracker.cached_mem_obj_ptr,
         )
 
 
@@ -518,6 +539,7 @@ class LMCacheConnectorV1Impl:
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.enable_sparse_attention = config.enable_sparse_attention
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -552,6 +574,7 @@ class LMCacheConnectorV1Impl:
                 "discard_partial_chunks", False
             )
             or not config.save_unfull_chunk
+            and not self.enable_sparse_attention
         )
 
         self._lmcache_chunk_size = config.chunk_size
@@ -755,6 +778,7 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+        self.load_time = defaultdict(int)
 
         if len(self.kv_caches) == 0:
             logger.warning(
@@ -825,6 +849,22 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
+                elif request.is_sparse_decode:
+                    self.load_time[idx] = 0
+                    layerwise_retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
+                        tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
+                        token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
+                        kvcaches=kvcaches, # needed to allocate gpu buffer of the same size
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens], # same attention blocks for all layers
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        sync=sync,
+                        cached_keys=request.cached_keys,
+                        cached_mem_obj_ptr=request.cached_mem_obj_ptr,
+                        req_id=request.req_id,
+                    )
+                    # NOTE: retrieve layers one by one without prefetch
+                    next(layerwise_retriever) 
+                    self.layerwise_retrievers.append(layerwise_retriever)
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
@@ -833,6 +873,7 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        req_id=request.req_id,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -952,7 +993,8 @@ class LMCacheConnectorV1Impl:
         return missing_blocks
 
     @_lmcache_nvtx_annotate
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(self, layer_name: str, selected_clusters: list[torch.Tensor], cluster_meta: list,
+        token_start_index: list[int], cluster_start_index: list[torch.Tensor], retrieve_budget: int) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
 
@@ -964,14 +1006,30 @@ class LMCacheConnectorV1Impl:
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
-        # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
 
-            if self.current_layer == self.num_layers - 1:
+        # Wait for the layer to be loaded
+        idx = 0
+        for request in metadata.requests:
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+            layerwise_retriever = self.layerwise_retrievers[idx]
+            if self.enable_sparse_attention:
+                cluster_meta_per_req = None if cluster_meta is None else cluster_meta[idx]
+                # TODO: make layerwise_retriever process load all naturally 
+                selected_clusters_per_req = torch.arange(request.load_spec.lmcache_cached_tokens) if selected_clusters is None else selected_clusters[idx]
+                token_start_index_per_req = 0 if token_start_index is None else token_start_index[idx]
+                cluster_start_index_per_req = cluster_start_index if cluster_start_index is None else cluster_start_index[idx]
+                ret_token_mask = layerwise_retriever.send((selected_clusters_per_req, token_start_index_per_req, cluster_meta_per_req, cluster_start_index_per_req, retrieve_budget))
+            else:
+                ret_token_mask = next(layerwise_retriever)
+
+            if self.current_layer == self.num_layers - 1 and not request.is_sparse_decode:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+            idx += 1
 
         if self.layerwise_retrievers:
             self.current_layer += 1
@@ -1073,6 +1131,8 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    cached_keys = request.cached_keys,
+                    cached_mem_obj_ptr = request.cached_mem_obj_ptr,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -1441,6 +1501,7 @@ class LMCacheConnectorV1Impl:
             self._unfinished_requests.pop(finished_req_id, None)
 
         # We should load KV for:
+        # 0. all requests in sparse decode case
         # 1. new requests
         # 2. preempted requests (once per recovery)
         # can_load will only be True if `update_state_after_alloc` has been called
@@ -1628,6 +1689,10 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
+            is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
+            if is_sparse_decode:
+                load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
+
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -1635,6 +1700,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                is_sparse_decode=is_sparse_decode
             )
             if req_meta is not None:
                 meta.add_request(req_meta)

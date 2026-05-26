@@ -28,6 +28,10 @@ from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSend
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
 
+if torch.cuda.is_available():
+    # First Party
+    import lmcache.c_ops as lmc_ops
+
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
@@ -57,6 +61,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
+        self.async_hot_cache = lmc_ops.ThreadPoolAsyncClusterMetaManager()
 
         self.use_hot = config.local_cpu
         # NOTE: we keep the memory allocator argument for temporary
@@ -157,6 +162,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
+            self.async_hot_cache.Put(key.to_string(), memory_obj.raw_tensor)
 
             self.cache_policy.update_on_put(key)
 
@@ -226,6 +232,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 mem_obj.ref_count_up()
                 mem_objs.append(mem_obj)
         return mem_objs
+
+
+    def batched_get_async(
+        self,
+        lookup_id: str,
+        keys: list[str],
+        transfer_spec: Any = None,
+    ):
+        with self.cpu_lock:
+            fut_mem_objs = self.async_hot_cache.BatchGetDevicePtr(keys)
+        return fut_mem_objs
+
 
     async def batched_async_contains(
         self,

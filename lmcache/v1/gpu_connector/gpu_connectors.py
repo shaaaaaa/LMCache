@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import time
 
 # Third Party
 import torch
@@ -116,6 +117,10 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         Note: Layerwise connectors receive memory objects
         via generator.send()
         """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def batched_to_gpu_head_token_wise(self, **kwargs):
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -972,11 +977,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
     def __init__(
         self,
         hidden_dim_size: int,
+        head_size: int,
         num_layers: int,
         use_gpu: bool = False,
         **kwargs,
     ):
         self.hidden_dim_size = hidden_dim_size
+        self.head_size = head_size
         self.num_layers = num_layers
         self.use_gpu = use_gpu
 
@@ -988,6 +995,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
         assert "device" in kwargs, "device should be provided to create a GPU buffer."
 
+        self.chunk_size = kwargs["chunk_size"]
         self.dtype = kwargs["dtype"]
         self.device = kwargs["device"]
 
@@ -1028,6 +1036,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         return cls(
             hidden_dim_size=hidden_dim_size,
+            head_size=head_size,
             num_layers=num_layers,
             use_gpu=use_gpu,
             chunk_size=chunk_size,
@@ -1043,6 +1052,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         the gpu buffer size in gpu connector.
         Also, the first request might be a bit slower due to buffer creation.
         """
+        self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.VLLM)
+        assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
+        self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
+        self.elements_per_layer = get_elements_per_layer(
+            kv_caches, self.gpu_kv_format
+        )
         if self.use_gpu and self.gpu_buffer_allocator is None:
             logger.info("Lazily initializing GPU buffer.")
             # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
@@ -1050,12 +1065,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
             # in layerwise mode.
 
-            self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.VLLM)
-            assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
-            self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
-            self.elements_per_layer = get_elements_per_layer(
-                kv_caches, self.gpu_kv_format
-            )
             logger.info(
                 f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
             )
@@ -1190,6 +1199,83 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
+
+        logger.debug(f"Finished loading all {self.num_layers} layers.")
+        yield
+
+    @_lmcache_nvtx_annotate
+    def batched_to_gpu_head_token_wise(self, **kwargs):
+        """
+        This function is a generator that moves the KV cache from the memory
+        objects to paged GPU memory. The first iteration will prepare some
+        related metadata. In each of the following iterations, it will first
+        wait until the loading of the previous layer finish, and then load
+        one layer of KV cache from the memory objects -> GPU buffer ->
+        paged GPU memory. The last iteration simply waits for the last layer
+        to finish.
+        In total, this the generator will yield num_layers + 2 times.
+
+        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        """
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        if "sync" not in kwargs:
+            raise ValueError("'sync' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        sync: bool = kwargs["sync"]
+
+        self._lazy_initialize_buffer(self.kvcaches)
+
+        current_stream = torch.cuda.current_stream()
+
+        for layer_id in range(self.num_layers):
+            mem_tensors_layer, current_selected, token_start_index, cluster_size, clusters, cluster_start_index, retrieve_budget = yield
+            if mem_tensors_layer is None or current_selected is None:
+                logger.debug(f"mem_tensors_layer for layer {layer_id - 1} is None, continue")
+                continue
+            if sync:
+                current_stream.wait_stream(self.load_stream)
+            if layer_id > 0:
+                logger.debug(f"Finished loading layer {layer_id - 1}")
+
+            # mem_tensors_layer list[tensor] num_chunks
+            with torch.cuda.stream(self.load_stream):
+                # TODO: Do not support mla currently
+                if cluster_size is None:
+                    lmc_ops.single_layer_sparse_kv_transfer_64_bit_addr(
+                        mem_tensors_layer,
+                        self.kvcaches[layer_id],    # [2, num_blocks, block_size, num_heads, head_size] for fa
+                        slot_mapping.to(self.kvcaches[layer_id].device),    # token indices to each slot in the block pool
+                        current_selected.to(self.kvcaches[layer_id].device),
+                        token_start_index,
+                        self.chunk_size
+                    )
+                else:
+                    lmc_ops.single_layer_sparse_clustered_kv_transfer_64_bit_addr(
+                        mem_tensors_layer,
+                        self.kvcaches[layer_id],    # [2, num_blocks, block_size, num_heads, head_size] for fa
+                        slot_mapping.to(self.kvcaches[layer_id].device),    # token indices to each slot in the block pool
+                        current_selected.to(self.kvcaches[layer_id].device),
+                        clusters,
+                        cluster_size,
+                        cluster_start_index,
+                        retrieve_budget,
+                        token_start_index,
+                        self.chunk_size
+                    )
+        yield
+
+        # synchronize the last layer
+        if sync:
+            current_stream.wait_stream(self.load_stream)
 
         logger.debug(f"Finished loading all {self.num_layers} layers.")
         yield
