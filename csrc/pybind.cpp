@@ -54,6 +54,11 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("slot_mapping"), py::arg("selected_clusters"), py::arg("clusters"), py::arg("cluster_size"),
         py::arg("cluster_start_index"),
         py::arg("retrieve_budget"), py::arg("token_start_index"), py::arg("num_tokens_per_chunk"));
+  m.def("single_layer_sparse_clustered_flattened_kv_transfer_64_bit_addr", &single_layer_sparse_clustered_flattened_kv_transfer_64_bit_addr,
+        py::arg("lmcache_tensor_ptrs"), py::arg("vllm_kv_cache"),
+        py::arg("slot_mapping"), py::arg("selected_clusters"), py::arg("clusters"), py::arg("cluster_size"),
+        py::arg("cluster_start_index"),
+        py::arg("retrieve_budget"), py::arg("token_start_index"), py::arg("num_tokens_per_chunk"));
   m.def("single_layer_sparse_kv_transfer", &single_layer_sparse_kv_transfer,
         py::arg("lmcache_tensors"), py::arg("vllm_kv_cache"),
         py::arg("slot_mapping"), py::arg("selected_tokens_per_head"), py::arg("token_start_index"),

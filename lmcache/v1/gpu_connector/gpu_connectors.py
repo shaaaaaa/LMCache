@@ -1259,7 +1259,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.chunk_size
                     )
                 else:
-                    lmc_ops.single_layer_sparse_clustered_kv_transfer_64_bit_addr(
+                    lmc_ops.single_layer_sparse_clustered_flattened_kv_transfer_64_bit_addr(
                         mem_tensors_layer,
                         self.kvcaches[layer_id],    # [2, num_blocks, block_size, num_heads, head_size] for fa
                         slot_mapping.to(self.kvcaches[layer_id].device),    # token indices to each slot in the block pool

@@ -347,6 +347,110 @@ __global__ void single_layer_sparse_kv_transfer_kernel(
 
 
 template <typename T>
+__global__ void single_layer_sparse_clustered_flattened_kv_transfer_kernel(
+    int64_t* __restrict__ lmcache_kv_device_ptrs,   // [num_chunks]
+    T* __restrict__ vllm_k,                         // vLLM K cache: [num_blocks, block_size, num_heads, head_dim]
+    T* __restrict__ vllm_v,                         // vLLM V cache
+    const int64_t* __restrict__ slot_mapping,       // [num_all_tokens]
+    const int32_t* __restrict__ clusters,           // [num_heads, num_clusters, max_cluster_size]
+    const int64_t* __restrict__ selected_clusters,  // [num_heads, num_selected_clusters]
+    const int32_t* __restrict__ cluster_size,       // [num_heads, num_clusters]
+    const int32_t* __restrict__ cluster_start_index,// [num_heads, num_selected_clusters]
+    const int32_t retrieve_budget,
+    const int num_chunks,
+    const int token_start_index,
+    const int num_selected_clusters,
+    const int num_heads,
+    const int num_tokens_per_chunk,
+    const int block_size,
+    const int head_dim,
+    const int stride_vllm_block,                    // = block_size * num_heads * head_dim
+    const int stride_vllm_slot,                     // = num_heads * head_dim
+    const int stride_vllm_head,                     // = head_dim
+    const int stride_lm_token,                      // = 2 * num_heads * head_dim
+    const int stride_lm_kv,                         // = num_heads * head_dim
+    const int stride_lm_dim,                        // = head_dim
+    const int stride_cluster_head,                  // = num_clusters * max_cluster_size
+    const int stride_cluster_num,                   // = max_cluster_size
+    const int stride_cs_head,                       // = num_clusters
+    const int stride_sel_head                       // = num_selected_clusters
+) {
+    extern __shared__ int32_t s_cumsum[];
+
+    const int head_idx = blockIdx.x;
+    const int token_idx = blockIdx.y;
+
+    for (int i = threadIdx.x; i < num_selected_clusters; i += blockDim.x) {
+        s_cumsum[i] = cluster_start_index[head_idx * stride_sel_head + i];
+    }
+    __syncthreads();
+
+    int total_tokens = s_cumsum[num_selected_clusters - 1];
+    if (token_idx >= total_tokens) {
+      // printf("[single_layer_sparse_clustered_kv_transfer_kernel] WARNING: head_idx: %d token_idx:%d, total_tokens=%d is less than token_idx\n", head_idx, token_idx, total_tokens);
+      return;
+    }
+
+    int l = 0, r = num_selected_clusters - 1;
+#pragma unroll
+    while (l < r) {
+        int mid = (l + r) >> 1;
+        if (s_cumsum[mid] <= token_idx)
+            l = mid + 1;
+        else
+            r = mid;
+    }
+    int cluster_idx = l;
+
+    int64_t real_cluster_id = selected_clusters[head_idx * stride_sel_head + cluster_idx];
+    int32_t cur_cluster_size = cluster_size[head_idx * stride_cs_head + real_cluster_id];
+
+    int32_t cluster_physical_start_index = s_cumsum[cluster_idx] - cur_cluster_size;
+    if (cluster_physical_start_index >= retrieve_budget)
+      return;
+
+    // 1.token index for this thread block
+    int32_t token_i = token_idx - cluster_physical_start_index;
+    const int32_t global_token_idx = clusters[head_idx * stride_cluster_head + real_cluster_id * stride_cluster_num + token_i];
+
+    // 2. lmcache chunk indexing
+    const int32_t chunk_idx = global_token_idx / num_tokens_per_chunk;
+    const int32_t token_offset = global_token_idx % num_tokens_per_chunk;
+
+    // 3. src cpu base ptr（CPU pinned memory）
+    if (chunk_idx >= num_chunks) {
+      printf("[single_layer_sparse_clustered_kv_transfer_kernel] ERROR: head_idx: %d cluster_idx: %d, chunk_idx=%d >= num_chunks=%d, global_token_idx = %d\n", head_idx, cluster_idx, chunk_idx, num_chunks, global_token_idx);
+      return;
+    }
+    T* chunk_ptr = reinterpret_cast<T*>(lmcache_kv_device_ptrs[chunk_idx]);
+
+    // 4. vllm slot indexing
+    const int64_t slot = slot_mapping[token_start_index + token_idx];
+    const int64_t block_idx = slot / block_size;
+    const int64_t block_offset = slot % block_size;
+
+    // 5. src
+    T* src_k = chunk_ptr + token_offset * stride_lm_token
+            + 0 * stride_lm_kv + head_idx * stride_lm_dim;
+    T* src_v = chunk_ptr + token_offset * stride_lm_token
+            + 1 * stride_lm_kv + head_idx * stride_lm_dim;
+
+    // 6. dst
+    T* dst_k = vllm_k + block_idx * stride_vllm_block
+            + block_offset * stride_vllm_slot + head_idx * stride_vllm_head;
+    T* dst_v = vllm_v + block_idx * stride_vllm_block
+            + block_offset * stride_vllm_slot + head_idx * stride_vllm_head;
+
+    // 7. copy
+#pragma unroll
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        dst_k[d] = src_k[d];
+        dst_v[d] = src_v[d];
+    }
+}
+
+
+template <typename T>
 __global__ void single_layer_sparse_clustered_kv_transfer_kernel(
     int64_t* __restrict__ lmcache_kv_device_ptrs,   // [num_chunks]
     T* __restrict__ vllm_k,                         // vLLM K cache: [num_blocks, block_size, num_heads, head_dim]
@@ -1284,6 +1388,117 @@ void single_layer_sparse_kv_transfer_64_bit_addr(
         stride_lm_token,
         stride_lm_kv,
         stride_lm_dim,
+        stride_sel_head
+    );
+}
+
+
+void single_layer_sparse_clustered_flattened_kv_transfer_64_bit_addr(
+    std::vector<int64_t>& lmcache_tensor_ptrs,    // [num_chunks] device ptrs
+    torch::Tensor& vllm_kv_cache,                 // [2, num_blocks, block_size, num_heads, head_dim]
+    torch::Tensor& slot_mapping,                  // [num_all_tokens] int64
+    torch::Tensor& selected_clusters,             // int64 [num_heads, num_selected_clusters]
+    torch::Tensor& clusters,                      // int32 [num_heads, num_clusters, max_cluster_size]
+    torch::Tensor& cluster_size,                  // int32 [num_heads, num_clusters]
+    torch::Tensor& cluster_start_index,           // int32 [num_heads, num_selected_clusters]
+    int32_t retrieve_budget,
+    int64_t token_start_index,
+    int64_t num_tokens_per_chunk
+) {
+    TORCH_CHECK(vllm_kv_cache.is_cuda(), "vllm_kv_cache must be on GPU");
+    TORCH_CHECK(slot_mapping.is_cuda(), "slot_mapping must be on GPU");
+    TORCH_CHECK(selected_clusters.is_cuda(), "selected_clusters must be on GPU");
+    TORCH_CHECK(clusters.is_cuda(), "clusters must be on GPU");
+    TORCH_CHECK(cluster_size.is_cuda(), "cluster_size must be on GPU");
+    TORCH_CHECK(cluster_start_index.is_cuda(), "cluster_start_index must be on GPU");
+
+    const int64_t* slot_mapping_ptr =
+        get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
+    const int64_t* selected_clusters_ptr =
+        get_kernel_ptr<const int64_t, const torch::Tensor>(selected_clusters);
+    const int32_t* clusters_ptr =
+        get_kernel_ptr<const int32_t, const torch::Tensor>(clusters);
+    const int32_t* cluster_size_ptr =
+        get_kernel_ptr<const int32_t, const torch::Tensor>(cluster_size);
+    const int32_t* cluster_start_index_ptr =
+        get_kernel_ptr<const int32_t, const torch::Tensor>(cluster_start_index);
+
+    // Get device pointer from host pointer
+    int64_t num_chunks = lmcache_tensor_ptrs.size();
+    auto dev_ptrs_tensor = torch::empty(
+        {num_chunks},
+        torch::TensorOptions().dtype(torch::kInt64).device(vllm_kv_cache.device())
+    );
+    int64_t* dev_ptrs_array = dev_ptrs_tensor.data_ptr<int64_t>();
+    cudaMemcpy(dev_ptrs_array,
+               lmcache_tensor_ptrs.data(),
+               num_chunks * sizeof(int64_t),
+               cudaMemcpyHostToDevice);
+
+    // selected info
+    const auto num_heads = selected_clusters.size(0);
+    const auto num_selected_clusters = selected_clusters.size(1);
+
+    // vllm info
+    auto vllm_k = vllm_kv_cache[0].contiguous();
+    auto vllm_v = vllm_kv_cache[1].contiguous();
+    int64_t* vllm_key_cache_ptr =
+        get_kernel_ptr<int64_t, torch::Tensor>(vllm_k);
+    int64_t* vllm_value_cache_ptr =
+        get_kernel_ptr<int64_t, torch::Tensor>(vllm_v);
+    const auto block_size = vllm_kv_cache.size(2);
+    const auto head_dim = vllm_kv_cache.size(4);
+    auto element_size = vllm_kv_cache.element_size();
+    int32_t elements_per_entry = 8 / element_size;
+    int32_t head_dim_in_64bit = head_dim / elements_per_entry;
+
+    // stride
+    // vllm tensor format: NL_X_TWO_NB_BS_NH_HS
+    const int32_t stride_vllm_block = vllm_k.stride(0) / elements_per_entry;   // block_size * num_heads * head_dim
+    const int32_t stride_vllm_slot  = vllm_k.stride(1) / elements_per_entry;   // num_heads * head_dim
+    const int32_t stride_vllm_head  = vllm_k.stride(2) / elements_per_entry;   // head_dim
+    // lmc memory_obj: [num_tokens, 2, num_heads, head_dim]
+    const int32_t stride_lm_token = 2 * num_heads * head_dim / elements_per_entry;
+    const int32_t stride_lm_kv = num_heads * head_dim / elements_per_entry;
+    const int32_t stride_lm_dim = head_dim / elements_per_entry;
+    // clusters [num_heads, num_clusters, max_cluster_size]
+    const int32_t stride_cluster_head = clusters.stride(0);
+    const int32_t stride_cluster_num = clusters.stride(1);
+    // selected_clusters [num_heads, num_selected_clusters]
+    const int32_t stride_sel_head = selected_clusters.stride(0);
+    // cluster_size [num_heads, num_clusters]
+    const int32_t stride_cs_head = cluster_size.stride(0);
+
+    // grid / block
+    dim3 grid(num_heads, retrieve_budget);
+    dim3 block(std::min(head_dim_in_64bit, 128));
+
+    lmc::single_layer_sparse_clustered_flattened_kv_transfer_kernel<int64_t><<<grid, block, num_selected_clusters * sizeof(int)>>>(
+        dev_ptrs_array,
+        vllm_key_cache_ptr,
+        vllm_value_cache_ptr,
+        slot_mapping_ptr,
+        clusters_ptr,
+        selected_clusters_ptr,
+        cluster_size_ptr,
+        cluster_start_index_ptr,
+        retrieve_budget,
+        static_cast<int32_t>(num_chunks),
+        static_cast<int32_t>(token_start_index),
+        static_cast<int32_t>(num_selected_clusters),
+        static_cast<int32_t>(num_heads),
+        static_cast<int32_t>(num_tokens_per_chunk),
+        static_cast<int32_t>(block_size),
+        static_cast<int32_t>(head_dim_in_64bit),
+        stride_vllm_block,
+        stride_vllm_slot,
+        stride_vllm_head,
+        stride_lm_token,
+        stride_lm_kv,
+        stride_lm_dim,
+        stride_cluster_head,
+        stride_cluster_num,
+        stride_cs_head,
         stride_sel_head
     );
 }

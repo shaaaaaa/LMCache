@@ -163,6 +163,17 @@ void single_layer_sparse_clustered_kv_transfer_64_bit_addr(std::vector<int64_t>&
                                                            int64_t token_start_index,
                                                            int64_t num_tokens_per_chunk);
 
+void single_layer_sparse_clustered_flattened_kv_transfer_64_bit_addr(std::vector<int64_t>& lmcache_tensor_ptrs,    // [num_chunks] device ptrs
+                                                                     torch::Tensor& vllm_kv_cache,                 // [2, num_blocks, block_size, num_heads, head_dim]
+                                                                     torch::Tensor& slot_mapping,                  // [num_all_tokens] int64
+                                                                     torch::Tensor& selected_clusters,             // cpu [num_heads, num_selected_clusters]
+                                                                     torch::Tensor& clusters,                      // cpu [num_heads, num_clusters, max_cluster_size]
+                                                                     torch::Tensor& cluster_size,
+                                                                     torch::Tensor& cluster_start_index,           // [num_heads, num_selected_clusters]
+                                                                     int32_t retrieve_budget,
+                                                                     int64_t token_start_index,
+                                                                     int64_t num_tokens_per_chunk);
+
 void single_layer_sparse_kv_transfer_64_bit_addr(std::vector<int64_t>& lmcache_tensor_ptrs, // list[num_chunks] int64
                                                  torch::Tensor& vllm_kv_cache,                // [2, num_blocks, block_size, num_heads, head_dim]
                                                  torch::Tensor& slot_mapping,                 // [num_all_tokens] int64
