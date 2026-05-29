@@ -61,7 +61,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
-        self.async_hot_cache = lmc_ops.ThreadPoolAsyncClusterMetaManager()
+        self.async_hot_cache = lmc_ops.ThreadPoolAsyncClusterMetaManager(4)
 
         self.use_hot = config.local_cpu
         # NOTE: we keep the memory allocator argument for temporary

@@ -1004,6 +1004,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
+        self.load_stream_num = 4
+        self.load_stream_list = [torch.cuda.Stream() for __ in range(self.load_stream_num)]
+        self.load_stream_idx = 0
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
@@ -1236,18 +1239,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         current_stream = torch.cuda.current_stream()
 
+        load_stream_idx = self.load_stream_idx
+        self.load_stream_idx = (self.load_stream_idx + 1) % self.load_stream_num
+
         for layer_id in range(self.num_layers):
             mem_tensors_layer, current_selected, token_start_index, cluster_size, clusters, cluster_start_index, retrieve_budget = yield
             if mem_tensors_layer is None or current_selected is None:
                 logger.debug(f"mem_tensors_layer for layer {layer_id - 1} is None, continue")
                 continue
-            if sync:
-                current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # mem_tensors_layer list[tensor] num_chunks
-            with torch.cuda.stream(self.load_stream):
+            with torch.cuda.stream(self.load_stream_list[load_stream_idx]):
                 # TODO: Do not support mla currently
                 if cluster_size is None:
                     lmc_ops.single_layer_sparse_kv_transfer_64_bit_addr(
@@ -1271,11 +1275,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         token_start_index,
                         self.chunk_size
                     )
+            current_stream.wait_stream(self.load_stream_list[load_stream_idx])
         yield
-
-        # synchronize the last layer
-        if sync:
-            current_stream.wait_stream(self.load_stream)
 
         logger.debug(f"Finished loading all {self.num_layers} layers.")
         yield

@@ -1126,7 +1126,7 @@ class LMCacheEngine:
 
         if not cached_keys and to_get_cpu_mem_obj:
             # prefix cache hit, first retrieve
-            logger.info(f"[req_id={req_id}] [retrieve_layer_head_token_wise] Prefix cache hit, construct key for prefill")
+            #logger.info(f"[req_id={req_id}] [retrieve_layer_head_token_wise] Prefix cache hit, construct key for prefill")
             location = None
             for start, end, key in self.token_database.process_tokens(
                 tokens=tokens,
@@ -1198,8 +1198,13 @@ class LMCacheEngine:
             except GeneratorExit:
                 raise
 
+            _sha_cpu_get_ms = 0.0  # [sha]
             if to_get_cpu_mem_obj:
+                _sha_t0 = time.perf_counter()  # [sha]
                 mem_objs_layer = task.get() # list[int]
+                # [sha] synchronous CPU-side fetch of this layer's memory objs
+                # (the suspected non-GC stall source; runs serially per request)
+                _sha_cpu_get_ms = (time.perf_counter() - _sha_t0) * 1000.0
                 if mem_objs_layer is None:
                     continue
                 if is_cached_mem_obj_ptr_init:
@@ -1220,11 +1225,21 @@ class LMCacheEngine:
                 next(mem_obj_consumer)
 
             if load_all:
+                _sha_t1 = time.perf_counter()  # [sha]
                 mem_obj_consumer.send((mem_objs_layer, tokens, token_start_index, None, None, cluster_start_index, retrieve_budget))
+                # [sha] split the per-layer wait into CPU fetch vs GPU-copy
+                # issue. cpu_get should carry the stall tail; gpu_copy_issue
+                # is just the async launch and should stay tiny. No cuda sync
+                # added here so overlap behavior is unchanged.
+                logger.info(
+                    "[sha] retrieve_layer layer_id=%d cpu_get %.3fms gpu_copy_issue %.3fms",
+                    layer_id, _sha_cpu_get_ms,
+                    (time.perf_counter() - _sha_t1) * 1000.0,
+                )
             else:
                 cluster_size = cluster_meta.cluster_size
                 clusters = cluster_meta.cluster_members
-                mem_obj_consumer.send((mem_objs_layer, selected_clusters, token_start_index, cluster_size, clusters, cluster_start_index, retrieve_budget))
+                #mem_obj_consumer.send((mem_objs_layer, selected_clusters, token_start_index, cluster_size, clusters, cluster_start_index, retrieve_budget))
             # TODO: refine the ref count logic in new async get inferface
             # to_count_down.extend(mem_objs_layer)
         for mem_obj in to_count_down:
@@ -1233,7 +1248,7 @@ class LMCacheEngine:
         # synchronize the last layer
         if not mem_obj_consumer:
             mem_obj_consumer = (x for x in [])  
-        next(mem_obj_consumer)
+        #next(mem_obj_consumer)
 
         yield ret_mask
 
