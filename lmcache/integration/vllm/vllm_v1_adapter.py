@@ -418,6 +418,14 @@ class ReqMeta:
         )
 
         slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+        if is_sparse_decode:
+            n_prefill_blocks = cdiv(tracker.prompt_len, block_size)
+            scratch_slots = (
+                block_offsets.reshape((1, block_size))
+                + block_ids[n_prefill_blocks:].reshape((-1, 1)) * block_size
+            ).flatten()
+            n = min(len(scratch_slots), len(slot_mapping))
+            slot_mapping[:n] = scratch_slots[:n]
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
@@ -1689,7 +1697,7 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
+            is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens >= request.num_prompt_tokens)
             if is_sparse_decode:
                 load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
 

@@ -106,6 +106,7 @@ PYBIND11_MODULE(c_ops, m) {
 
   py::class_<ThreadPoolAsyncClusterMetaManager>(m, "ThreadPoolAsyncClusterMetaManager")
     .def(py::init<>())
+    .def(py::init<int>(), py::arg("num_workers"))
     .def("Put", &ThreadPoolAsyncClusterMetaManager::Put,
       py::arg("key"), py::arg("obj"))
     .def("BatchGetDevicePtr", &ThreadPoolAsyncClusterMetaManager::BatchGetDevicePtr,

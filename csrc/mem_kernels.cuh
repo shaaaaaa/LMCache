@@ -201,17 +201,29 @@ public:
 
 class ThreadPoolAsyncClusterMetaManager {
 public:
-  ThreadPoolAsyncClusterMetaManager()
-    : stop_(false) {
-    // 1. main thread CPU
+  explicit ThreadPoolAsyncClusterMetaManager(int num_workers = 8)
+    : stop_(false)
+  {
     main_cpu_ = sched_getcpu();
     if (main_cpu_ == -1) main_cpu_ = 0; // fallback
 
-    // 2. another cpu
     int num_cpus = sysconf(_SC_NPROCESSORS_CONF);
-    chosen_cpu_ = (main_cpu_ + 1) % num_cpus;
+    if (num_cpus <= 0) num_cpus = 1;
 
-    worker_ = std::thread(&ThreadPoolAsyncClusterMetaManager::workerLoop, this);
+    if (num_workers == 0) {
+      num_workers = std::thread::hardware_concurrency();
+      if (num_workers == 0) num_workers = 2;
+      if (num_workers > 1) num_workers /= 2;
+    }
+    if (num_workers < 1) num_workers = 1;
+
+    for (size_t i = 0; i < num_workers; ++i) {
+      int cpu = (main_cpu_ + 1 + i) % num_cpus;
+      workers_.emplace_back([this, cpu]() {
+        // bindToCpu(cpu);
+        workerLoop();
+      });
+    }
   }
 
   ~ThreadPoolAsyncClusterMetaManager() {
@@ -219,16 +231,18 @@ public:
       std::lock_guard<std::mutex> lock(queue_mutex_);
       stop_ = true;
     }
-    cv_.notify_one();
-    if (worker_.joinable()) {
-      worker_.join();
+    cv_.notify_all();
+    for (auto& t : workers_) {
+      if (t.joinable()) {
+          t.join();
+      }
     }
   }
   ThreadPoolAsyncClusterMetaManager(const ThreadPoolAsyncClusterMetaManager&) = delete;
   ThreadPoolAsyncClusterMetaManager& operator=(const ThreadPoolAsyncClusterMetaManager&) = delete;
 
-  void Put(const std::string &key, torch::Tensor& obj);
-  std::future<std::vector<uintptr_t> > BatchGetDevicePtr(std::vector<std::string>& keys);
+  void Put(const std::string& key, torch::Tensor& obj);
+  std::future<std::vector<uintptr_t>> BatchGetDevicePtr(std::vector<std::string> keys);
 
 private:
   void workerLoop() {
@@ -240,12 +254,12 @@ private:
         std::unique_lock<std::mutex> lock(queue_mutex_);
         cv_.wait(lock, [this] { return stop_ || !task_queue_.empty(); });
         if (stop_ && task_queue_.empty()) {
-            break;
+          break;
         }
         task = std::move(task_queue_.front());
         task_queue_.pop();
       }
-      task(); // 执行任务
+      task(); // read storage
     }
   }
 
@@ -254,21 +268,17 @@ private:
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
     pthread_t thread = pthread_self();
-    if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) {
-      // do nothing
-    }
+    pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
   }
 
   std::unordered_map<std::string, int64_t*> chunk_storage; // key is cache_key, unique for request / layer / chunk
-  mutable std::shared_mutex storage_mutex_;   // 保护 chunk_storage
+  mutable std::shared_mutex storage_mutex_;   // protect chunk_storage
 
   std::queue<std::function<void()>> task_queue_;
   std::mutex queue_mutex_;
   std::condition_variable cv_;
-  std::thread worker_;
+  std::vector<std::thread> workers_;
   std::atomic<bool> stop_;
 
-  // bind cpu
   int main_cpu_;
-  int chosen_cpu_;
 };

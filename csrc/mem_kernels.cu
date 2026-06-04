@@ -1368,8 +1368,9 @@ void single_layer_sparse_kv_transfer_64_bit_addr(
     // grid / block
     dim3 grid(num_heads, num_selected_tokens);
     dim3 block(std::min(head_dim_in_64bit, 128));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    lmc::single_layer_sparse_kv_transfer_kernel<int64_t><<<grid, block>>>(
+    lmc::single_layer_sparse_kv_transfer_kernel<int64_t><<<grid, block, 0, stream>>>(
         dev_ptrs_array,
         vllm_key_cache_ptr,
         vllm_value_cache_ptr,
@@ -1472,8 +1473,9 @@ void single_layer_sparse_clustered_flattened_kv_transfer_64_bit_addr(
     // grid / block
     dim3 grid(num_heads, retrieve_budget);
     dim3 block(std::min(head_dim_in_64bit, 128));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    lmc::single_layer_sparse_clustered_flattened_kv_transfer_kernel<int64_t><<<grid, block, num_selected_clusters * sizeof(int)>>>(
+    lmc::single_layer_sparse_clustered_flattened_kv_transfer_kernel<int64_t><<<grid, block, num_selected_clusters * sizeof(int), stream>>>(
         dev_ptrs_array,
         vllm_key_cache_ptr,
         vllm_value_cache_ptr,
@@ -1945,14 +1947,11 @@ void AsyncClusterMetaManager::Put(const std::string &key, torch::Tensor& obj) {
 }
 
 
-std::future<std::vector<uintptr_t> > ThreadPoolAsyncClusterMetaManager::BatchGetDevicePtr(std::vector<std::string>& keys) {
-
-  // 创建 promise 和 future
+std::future<std::vector<uintptr_t>> ThreadPoolAsyncClusterMetaManager::BatchGetDevicePtr(std::vector<std::string> keys) {
   auto promise = std::make_shared<std::promise<std::vector<uintptr_t>>>();
   std::future<std::vector<uintptr_t>> future = promise->get_future();
 
-  // 封装任务
-  auto task = [this, keys, promise]() {
+  auto task = [this, keys = std::move(keys), promise]() {
     try {
       std::vector<uintptr_t> res;
       {
@@ -1972,7 +1971,6 @@ std::future<std::vector<uintptr_t> > ThreadPoolAsyncClusterMetaManager::BatchGet
     }
   };
 
-  // 将任务放入队列
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     task_queue_.push(std::move(task));
