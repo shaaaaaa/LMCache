@@ -8,7 +8,12 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.gpu_connector.sparse import build_prepared_sparse_source
+from lmcache.v1.gpu_connector.sparse import (
+    PreparedSparseGraphStep,
+    PreparedSparseSource,
+    PreparedSparseSourceLayer,
+    build_prepared_sparse_source,
+)
 from lmcache.v1.memory_management import MemoryObj
 
 
@@ -130,3 +135,42 @@ def test_build_prepared_sparse_source_rejects_noncontiguous_pointer_table() -> N
             num_layers=1,
             total_tokens=6,
         )
+
+
+def test_graph_step_pins_each_owner_once_until_release() -> None:
+    owner = MagicMock(spec=MemoryObj)
+    owner.is_valid.return_value = True
+    layer = PreparedSparseSourceLayer(
+        tensors=(),
+        chunk_ptrs_npu=torch.tensor([101], dtype=torch.int64),
+        memory_objs=(owner,),
+    )
+    source = PreparedSparseSource(
+        layers=(layer, layer),
+        total_tokens=4,
+        chunk_token_counts=(4,),
+    )
+
+    step = PreparedSparseGraphStep.acquire(
+        ("request-0",),
+        ("layers.0",),
+        (source,),
+        request_capacity=2,
+    )
+    owner.ref_count_up.assert_called_once_with()
+    assert step.matches(
+        ("request-0",),
+        ("layers.0",),
+        (source,),
+        request_capacity=2,
+    )
+
+    step.release()
+    step.release()
+    owner.ref_count_down.assert_called_once_with()
+    assert not step.matches(
+        ("request-0",),
+        ("layers.0",),
+        (source,),
+        request_capacity=2,
+    )

@@ -4,6 +4,7 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from itertools import count
 from typing import Optional
 
 # Third Party
@@ -11,6 +12,9 @@ import torch
 
 # First Party
 from lmcache.v1.memory_management import MemoryObj
+
+
+_PREPARED_SPARSE_SOURCE_IDS = count(1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +34,110 @@ class PreparedSparseSource:
     total_tokens: int
     chunk_token_counts: tuple[int, ...] = field(default_factory=tuple)
     pointer_device: Optional[torch.device] = None
+    binding_id: int = field(
+        default_factory=lambda: next(_PREPARED_SPARSE_SOURCE_IDS)
+    )
+
+
+@dataclass(slots=True)
+class PreparedSparseGraphStep:
+    """Pinned, request-aligned sparse sources for one device-graph replay."""
+
+    request_ids: tuple[str, ...]
+    layer_names: tuple[str, ...]
+    sources: tuple[PreparedSparseSource, ...]
+    request_capacity: int
+    _owners: tuple[MemoryObj, ...] = field(default_factory=tuple, repr=False)
+    _sources_by_request: dict[str, PreparedSparseSource] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _released: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def acquire(
+        cls,
+        request_ids: Sequence[str],
+        layer_names: Sequence[str],
+        sources: Sequence[PreparedSparseSource],
+        request_capacity: int,
+    ) -> "PreparedSparseGraphStep":
+        """Pin source owners until graph replay completion is fenced."""
+        request_tuple = tuple(request_ids)
+        source_tuple = tuple(sources)
+        layer_tuple = tuple(layer_names)
+        if not request_tuple or len(request_tuple) != len(source_tuple):
+            raise ValueError("Graph sources must align with non-empty request IDs")
+        if len(request_tuple) > request_capacity:
+            raise ValueError("Graph request count exceeds its fixed capacity")
+        if not layer_tuple:
+            raise ValueError("Graph source layer names must not be empty")
+        if any(len(source.layers) < len(layer_tuple) for source in source_tuple):
+            raise ValueError("Graph sources must cover every target layer")
+
+        owners: list[MemoryObj] = []
+        seen_owner_ids: set[int] = set()
+        try:
+            for source in source_tuple:
+                for layer in source.layers:
+                    for owner in layer.memory_objs:
+                        owner_id = id(owner)
+                        if owner_id in seen_owner_ids:
+                            continue
+                        if not owner.is_valid():
+                            raise RuntimeError(
+                                "Sparse graph source owner is no longer valid"
+                            )
+                        owner.ref_count_up()
+                        seen_owner_ids.add(owner_id)
+                        owners.append(owner)
+        except BaseException:
+            for owner in reversed(owners):
+                if owner.is_valid():
+                    owner.ref_count_down()
+            raise
+        return cls(
+            request_ids=request_tuple,
+            layer_names=layer_tuple,
+            sources=source_tuple,
+            request_capacity=int(request_capacity),
+            _owners=tuple(owners),
+            _sources_by_request=dict(
+                zip(request_tuple, source_tuple, strict=True)
+            ),
+        )
+
+    def release(self) -> None:
+        """Drop graph-owned references after the replay fence completes."""
+        if self._released:
+            return
+        self._released = True
+        for owner in reversed(self._owners):
+            if owner.is_valid():
+                owner.ref_count_down()
+
+    def matches(
+        self,
+        request_ids: Sequence[str],
+        layer_names: Sequence[str],
+        sources: Sequence[PreparedSparseSource],
+        request_capacity: int,
+    ) -> bool:
+        """Return whether this pinned binding can be reused without CPU work."""
+        return bool(
+            not self._released
+            and self.request_ids == tuple(request_ids)
+            and self.layer_names == tuple(layer_names)
+            and self.request_capacity == int(request_capacity)
+            and tuple(source.binding_id for source in self.sources)
+            == tuple(source.binding_id for source in sources)
+        )
+
+    def source_for_request(
+        self, request_id: str
+    ) -> Optional[PreparedSparseSource]:
+        """Look up one lane without rebuilding a per-step request map."""
+        return self._sources_by_request.get(request_id)
 
 
 def build_prepared_sparse_source(

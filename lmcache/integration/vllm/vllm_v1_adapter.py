@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -63,6 +63,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.gpu_connector.sparse import (
+    PreparedSparseGraphStep,
     PreparedSparseSource,
     build_prepared_sparse_source,
 )
@@ -1745,6 +1746,15 @@ class LMCacheConnectorV1Impl:
         )
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        self._active_sparse_graph_step: Optional[
+            PreparedSparseGraphStep
+        ] = None
+        self._cached_sparse_graph_step: Optional[
+            PreparedSparseGraphStep
+        ] = None
+        self._retired_sparse_graph_steps: list[
+            PreparedSparseGraphStep
+        ] = []
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
             self._worker_retrieve_registry_version = 0
@@ -5428,6 +5438,141 @@ class LMCacheConnectorV1Impl:
             return False
         return True
 
+    def prepare_sparse_graph_step(
+        self,
+        request_ids: Sequence[str],
+        target_layer_names: Sequence[str],
+        request_capacity: int,
+    ) -> Optional[PreparedSparseGraphStep]:
+        """Acquire warm, request-aligned sources for one target graph replay.
+
+        Cold loads and decode-window frontier changes return ``None`` and use
+        the existing eager layerwise path. In two-group DSA mode the indexer
+        group must already be resident because target graph replay cannot run
+        the host-side index materialization protocol.
+        """
+        if not hasattr(self, "_worker_retrieve_state"):
+            return None
+        if self._active_sparse_graph_step is not None:
+            raise RuntimeError("A sparse graph step is already active")
+
+        layer_names = tuple(target_layer_names)
+        all_latent_layer_names = tuple(self._latent_layer_names)
+        if (
+            not layer_names
+            or all_latent_layer_names[: len(layer_names)] != layer_names
+        ):
+            return None
+        ordered_request_ids = tuple(str(req_id) for req_id in request_ids)
+        if (
+            not ordered_request_ids
+            or len(set(ordered_request_ids)) != len(ordered_request_ids)
+            or len(ordered_request_ids) > int(request_capacity)
+        ):
+            return None
+
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+        sparse_requests = {
+            request.req_id: request
+            for request in metadata.requests
+            if request.is_sparse_decode
+            and request.load_spec is not None
+            and request.load_spec.can_load
+        }
+        if set(sparse_requests) != set(ordered_request_ids):
+            return None
+
+        shared_cpu_enabled = bool(
+            getattr(self.lmcache_engine, "enable_shared_cpu_cache", False)
+        )
+        sources: list[PreparedSparseSource] = []
+        for req_id in ordered_request_ids:
+            request = sparse_requests[req_id]
+            state = self._worker_retrieve_state_for_request(request)
+            if state is None or request.load_spec is None:
+                return None
+            token_count = (
+                int(state.token_count)
+                if request.sparse_warm_ref
+                else int(request.load_spec.lmcache_cached_tokens)
+            )
+            if (
+                request.sparse_warm_ref
+                and (
+                    state.token_count
+                    < int(request.load_spec.lmcache_cached_tokens)
+                    or state.slot_mapping is None
+                )
+            ):
+                return None
+            source = self._prepared_sparse_source(state, 0, token_count)
+            if source is None:
+                return None
+            if self._sparse_decode_requires_index_materialization(
+                request, shared_cpu_enabled
+            ):
+                indexer_mode = self._shared_sparse_decode_indexer_retrieve_mode(
+                    request,
+                    state,
+                    token_count,
+                )
+                if indexer_mode != INDEXER_RETRIEVE_RESIDENT_SKIP:
+                    return None
+            sources.append(source)
+
+        step = self._cached_sparse_graph_step
+        if step is None or not step.matches(
+            ordered_request_ids,
+            layer_names,
+            sources,
+            int(request_capacity),
+        ):
+            if step is not None:
+                self._retired_sparse_graph_steps.append(step)
+                self._cached_sparse_graph_step = None
+            step = PreparedSparseGraphStep.acquire(
+                ordered_request_ids,
+                layer_names,
+                sources,
+                int(request_capacity),
+            )
+            self._cached_sparse_graph_step = step
+        self._active_sparse_graph_step = step
+        return step
+
+    def retire_sparse_graph_binding(self) -> None:
+        """Stop retaining an inactive graph binding after its replay fence."""
+        step = self._cached_sparse_graph_step
+        if step is not None:
+            self._retired_sparse_graph_steps.append(step)
+            self._cached_sparse_graph_step = None
+
+    def take_retired_sparse_graph_steps(
+        self,
+    ) -> tuple[PreparedSparseGraphStep, ...]:
+        """Transfer ownership of bindings waiting for replay completion."""
+        retired = tuple(self._retired_sparse_graph_steps)
+        self._retired_sparse_graph_steps.clear()
+        return retired
+
+    def release_sparse_graph_bindings(self) -> None:
+        """Release every cached binding after the caller synchronizes replay."""
+        self._active_sparse_graph_step = None
+        self.retire_sparse_graph_binding()
+        for step in self.take_retired_sparse_graph_steps():
+            step.release()
+
+    def finish_sparse_graph_step(self) -> None:
+        """End target-graph setup while preserving any MTP draft retrievers."""
+        step = self._active_sparse_graph_step
+        self._active_sparse_graph_step = None
+        if step is not None and len(step.layer_names) >= self.num_layers:
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+            self._finalize_worker_retrieve_state_from_metadata(metadata)
+            self._drain_layerwise_retrievers(finish_dense=False)
+
     def _publish_worker_retrieve_state(
         self,
         state: WorkerRetrieveState,
@@ -5589,6 +5734,20 @@ class LMCacheConnectorV1Impl:
                 "kv_group": kv_group,
                 "prepared_sparse_source": prepared_source,
             }
+            graph_step = getattr(self, "_active_sparse_graph_step", None)
+            if graph_step is not None and kv_group == 0:
+                graph_source = graph_step.source_for_request(request.req_id)
+                if graph_source is not None:
+                    if graph_source is not prepared_source:
+                        raise RuntimeError(
+                            "Sparse graph source changed during step setup"
+                        )
+                    # Target layers are replayed by the device graph. Any
+                    # trailing prepared layers belong to the MTP drafter and
+                    # remain on the ordinary layerwise generator protocol.
+                    retrieve_kwargs["prepared_start_layer"] = len(
+                        graph_step.layer_names
+                    )
         else:
             if (
                 shared_cpu_enabled
@@ -6786,6 +6945,13 @@ class LMCacheConnectorV1Impl:
                         retrieve_slot_mapping,
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+        graph_step = getattr(self, "_active_sparse_graph_step", None)
+        if graph_step is not None:
+            # Target-layer graph replay replaces these generator iterations.
+            # Advancing the logical cursor lets the next MTP callback consume
+            # the first trailing draft layer and finalize normally.
+            self.current_layer = len(graph_step.layer_names)
 
     def record_failed_blocks(
         self,
